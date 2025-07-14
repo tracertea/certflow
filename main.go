@@ -9,6 +9,7 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"os/signal"
+	"path/filepath" // Make sure filepath is imported
 	"sync"
 	"syscall"
 
@@ -36,13 +37,18 @@ func main() {
 		}
 	}()
 
-	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Fatal: Could not create output directory %s: %v\n", cfg.OutputDir, err)
+	// --- NEW: Define the log-specific base directory ---
+	activeLog := cfg.ActiveLog
+	logSpecificDir := filepath.Join(cfg.OutputDir, activeLog.GetCleanName())
+
+	// Create the main directory for this specific log run.
+	if err := os.MkdirAll(logSpecificDir, 0755); err != nil {
+		fmt.Fprintf(os.Stderr, "Fatal: Could not create log-specific output directory %s: %v\n", logSpecificDir, err)
 		os.Exit(1)
 	}
 
-	// Initialize the logger.
-	logger, logFile := logging.New(cfg.OutputDir, cfg.LogFile)
+	// Initialize the logger to write to the log-specific directory.
+	logger, logFile := logging.New(logSpecificDir, cfg.LogFile)
 	if logFile != nil {
 		defer logFile.Close()
 	}
@@ -60,8 +66,8 @@ func main() {
 		cancel()
 	}()
 
-	// Initialize and lock the State Manager.
-	stateMgr, err := state.NewManager(cfg.OutputDir, logger)
+	// Initialize and lock the State Manager in the log-specific directory.
+	stateMgr, err := state.NewManager(logSpecificDir, logger)
 	if err != nil {
 		logger.Error("Failed to initialize state manager.", "error", err)
 		os.Exit(1)
@@ -76,7 +82,6 @@ func main() {
 	}
 
 	// --- Concurrency and Channel Sizing ---
-	activeLog := cfg.ActiveLog
 	concurrencyPerProxy := activeLog.DownloadJobs
 	totalPossibleConcurrency := concurrencyPerProxy
 	if len(cfg.Proxies) > 0 {
@@ -85,13 +90,11 @@ func main() {
 
 	logger.Info(
 		"Certflow starting.",
-		"log_description", activeLog.Description,
-		"log_url", activeLog.URL,
+		"log_dir", logSpecificDir, // Log the directory we're using
 		"concurrency_per_proxy", concurrencyPerProxy,
 		"total_possible_concurrency", totalPossibleConcurrency,
 		"job_size", activeLog.DownloadSize,
 		"batch_size", cfg.BatchSize,
-		"aggregator_buffer", cfg.AggregatorBufferSize,
 		"resume_from_index", startIndex,
 	)
 
@@ -99,7 +102,6 @@ func main() {
 	jobsChan := make(chan *ctlog.DownloadJob, totalPossibleConcurrency*2)
 	resultsChan := make(chan *network.DownloadResult, totalPossibleConcurrency*2)
 	formattedChan := make(chan *processing.FormattedEntry, cfg.AggregatorBufferSize)
-	// Create a channel for completed batch files to be sent for compression.
 	gzipChan := make(chan string, 100)
 
 	// --- Instantiate all pipeline components ---
@@ -112,20 +114,22 @@ func main() {
 		os.Exit(1)
 	}
 	formatterPool := processing.NewFormattingWorkerPool(resultsChan, formattedChan, logger)
-	// Instantiate the new GZipper component.
 	gzipper := processing.NewGZipper(gzipChan, logger)
-	// Pass the new gzipChan to the FileAggregator constructor.
-	fileAggregator := processing.NewFileAggregator(
+	fileAggregator, err := processing.NewFileAggregator(
 		stateMgr,
 		formattedChan,
-		cfg.OutputDir,
+		logSpecificDir, // <-- Pass the log-specific path
 		cfg.BatchSize,
 		cfg.StateSaveTicker,
-		gzipChan, // <-- Pass the new channel
+		gzipChan,
 		cfg.AggregatorBufferSize,
 		startIndex,
 		logger,
 	)
+	if err != nil {
+		logger.Error("Failed to initialize file aggregator.", "error", err)
+		os.Exit(1)
+	}
 	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager, cfg.AggregatorBufferSize, jobsChan, resultsChan, formattedChan)
 
 	// =================================================================
@@ -138,7 +142,6 @@ func main() {
 	wg.Add(1)
 	go jobGenerator.Run(ctx, &wg)
 
-	// Worker pool is a fixed, generous size. The ProxyManager enforces per-proxy limits.
 	numWorkers := 100
 	logger.Info("Starting download worker pool", "worker_count", numWorkers)
 	wg.Add(numWorkers)
@@ -153,7 +156,6 @@ func main() {
 	wg.Add(1)
 	go fileAggregator.Run(ctx, &wg)
 
-	// Launch the GZipper goroutine.
 	wg.Add(1)
 	go gzipper.Run(ctx, &wg)
 

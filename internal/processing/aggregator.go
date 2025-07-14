@@ -31,12 +31,18 @@ type FileAggregator struct {
 }
 
 // NewFileAggregator creates a new file aggregator.
-func NewFileAggregator(stateMgr *state.Manager, formattedChan <-chan *FormattedEntry, outputDir string, batchSize uint64, stateSaveInterval time.Duration, gzipChan chan<- string, bufferSize int, startIndex uint64, logger *slog.Logger) *FileAggregator {
+func NewFileAggregator(stateMgr *state.Manager, formattedChan <-chan *FormattedEntry, outputDir string, batchSize uint64, stateSaveInterval time.Duration, gzipChan chan<- string, bufferSize int, startIndex uint64, logger *slog.Logger) (*FileAggregator, error) {
+	certsDir := filepath.Join(outputDir, "certs")
+	if err := os.MkdirAll(certsDir, 0755); err != nil {
+		// If we can't create the directory, we can't continue. Return an error.
+		return nil, fmt.Errorf("could not create certs output directory %s: %w", certsDir, err)
+	}
+
 	fa := &FileAggregator{
 		logger:              logger.With("component", "aggregator"),
 		stateMgr:            stateMgr,
 		formattedChan:       formattedChan,
-		outputDir:           outputDir,
+		outputDir:           certsDir,
 		batchSize:           batchSize,
 		stateSaveInterval:   stateSaveInterval,
 		bufferHighWaterMark: bufferSize,
@@ -46,7 +52,7 @@ func NewFileAggregator(stateMgr *state.Manager, formattedChan <-chan *FormattedE
 		openFiles:           make(map[string]*os.File),
 	}
 	fa.lastProcessedIndex.Store(startIndex)
-	return fa
+	return fa, nil
 }
 
 // Run starts the aggregator loop. This must be run in a single goroutine.
