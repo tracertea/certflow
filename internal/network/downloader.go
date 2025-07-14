@@ -15,13 +15,11 @@ import (
 
 const maxJobRetries = 10
 
-// DownloadResult holds the raw data from a successful get-entries request.
 type DownloadResult struct {
 	Job  *ctlog.DownloadJob
 	Data []byte
 }
 
-// DownloadWorker is a goroutine that fetches certificate entries.
 type DownloadWorker struct {
 	id           int
 	logURL       string
@@ -31,7 +29,6 @@ type DownloadWorker struct {
 	logger       *slog.Logger
 }
 
-// NewDownloadWorker creates a new worker.
 func NewDownloadWorker(id int, logURL string, jobsChan <-chan *ctlog.DownloadJob, resultsChan chan<- *DownloadResult, proxyMgr *ProxyManager, logger *slog.Logger) *DownloadWorker {
 	return &DownloadWorker{
 		id:           id,
@@ -43,7 +40,6 @@ func NewDownloadWorker(id int, logURL string, jobsChan <-chan *ctlog.DownloadJob
 	}
 }
 
-// Run starts the worker loop. It will exit when the jobsChan is closed.
 func (w *DownloadWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 	w.logger.Info("Download worker starting.")
@@ -64,7 +60,6 @@ func (w *DownloadWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob) {
-	// Add this log line to see when a worker picks up a job.
 	//w.logger.Debug("Worker received job.", "start", job.Start, "end", job.End)
 
 	getEntriesURL, err := url.Parse(w.logURL)
@@ -90,37 +85,34 @@ func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob)
 
 		proxy, err := w.proxyManager.GetClient()
 		if err != nil {
-			// Add detailed logging for this specific failure case.
 			w.logger.Warn("Download attempt failed: could not get proxy.", "start", job.Start, "attempt", attempt+1, "error", err)
 			continue
 		}
 
 		var success bool
-		release := func() { w.proxyManager.ReleaseClient(proxy, success) }
+		// MODIFIED: The release func now takes the number of certs processed.
+		release := func(count uint64) { w.proxyManager.ReleaseClient(proxy, success, count) }
 
 		req, _ := http.NewRequestWithContext(ctx, "GET", getEntriesURL.String(), nil)
 		resp, err := proxy.client.Do(req)
 		if err != nil {
-			// Add detailed logging
 			w.logger.Warn("Download attempt failed: http request error.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "error", err)
-			release()
+			release(0) // Release with 0 certs on failure
 			continue
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			// Add detailed logging
 			w.logger.Warn("Download attempt failed: non-200 status.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "status", resp.StatusCode)
 			resp.Body.Close()
-			release()
+			release(0) // Release with 0 certs on failure
 			continue
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			// Add detailed logging
 			w.logger.Warn("Download attempt failed: could not read body.", "start", "job.Start", "attempt", attempt+1, "proxy", proxy.URL, "error", err)
-			release()
+			release(0) // Release with 0 certs on failure
 			continue
 		}
 
@@ -129,16 +121,16 @@ func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob)
 		select {
 		case w.resultsChan <- result:
 			success = true
-			release()
-			// Add a success log line.
+			// MODIFIED: On success, release with the actual number of certs in the job.
+			certCountInJob := (job.End - job.Start) + 1
+			release(certCountInJob)
 			//w.logger.Debug("Worker sent result to formatter.", "start", job.Start, "end", job.End)
 			return
 		case <-ctx.Done():
-			release()
+			release(0) // Release with 0 certs if we are shutting down.
 			return
 		}
 	}
 
-	// This is the most important log line for finding lost data.
 	w.logger.Error("CRITICAL: Job failed permanently and was dropped.", "start", job.Start, "end", job.End)
 }

@@ -8,32 +8,36 @@ import (
 	"net/url"
 	"reflect"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tracertea/certflow/internal/config"
 )
 
-// proxyState and Proxy structs remain the same
 type proxyState int
 
 const (
 	healthy proxyState = iota
 	unhealthy
-	maxCooldown = 30 * time.Minute // Maximum cooldown to prevent infinite backoff
+	maxCooldown = 30 * time.Minute
 )
 
+// Proxy now tracks the number of certificates it has downloaded.
 type Proxy struct {
 	URL              *url.URL
 	state            proxyState
 	failures         int
 	concurrencySlots chan struct{}
 	client           *http.Client
+	CertsDownloaded  atomic.Uint64 // <-- NEW: Tracks certs per proxy.
 }
 
+// ProxyStatus includes the total cert count for UI display.
 type ProxyStatus struct {
-	URL      string
-	State    string // "Healthy", "Unhealthy"
-	Failures int
+	URL             string
+	State           string // "Healthy", "Unhealthy"
+	Failures        int
+	CertsDownloaded uint64 // <-- NEW: To pass total to UI.
 }
 
 type ProxyManager struct {
@@ -41,14 +45,13 @@ type ProxyManager struct {
 	proxies []*Proxy
 	cfg     *config.Config
 	logger  *slog.Logger
-	logURL  string // <-- NEW: Store log URL for health checks
+	logURL  string
 }
 
-// NewProxyManager initializes the proxy pool.
-// It now accepts the logURL for health checking.
+// NewProxyManager remains the same structurally.
 func NewProxyManager(logURL string, concurrencyPerProxy int, cfg *config.Config, logger *slog.Logger) (*ProxyManager, error) {
 	mgr := &ProxyManager{
-		logURL: logURL, // <-- NEW
+		logURL: logURL,
 		cfg:    cfg,
 		logger: logger.With("component", "proxy_manager"),
 	}
@@ -102,7 +105,7 @@ func NewProxyManager(logURL string, concurrencyPerProxy int, cfg *config.Config,
 	return mgr, nil
 }
 
-// GetClient blocks until a concurrency slot from any healthy proxy is available.
+// GetClient remains the same.
 func (m *ProxyManager) GetClient() (*Proxy, error) {
 	m.RLock()
 	cases := make([]reflect.SelectCase, 0)
@@ -119,7 +122,6 @@ func (m *ProxyManager) GetClient() (*Proxy, error) {
 	m.RUnlock()
 
 	if len(cases) == 0 {
-		// This is a temporary state, so a short sleep is fine. The loop will retry.
 		time.Sleep(2 * time.Second)
 		return nil, fmt.Errorf("no healthy proxies available")
 	}
@@ -131,15 +133,16 @@ func (m *ProxyManager) GetClient() (*Proxy, error) {
 	return activeProxies[chosen], nil
 }
 
-// ReleaseClient returns a client to the pool and updates its health.
-func (m *ProxyManager) ReleaseClient(p *Proxy, success bool) {
+// ReleaseClient now accepts a certCount to update proxy stats on success.
+func (m *ProxyManager) ReleaseClient(p *Proxy, success bool, certCount uint64) {
 	defer func() {
 		p.concurrencySlots <- struct{}{}
 	}()
 
 	if success {
 		m.Lock()
-		p.failures = 0 // Reset failures on success
+		p.failures = 0                   // Reset failures on success.
+		p.CertsDownloaded.Add(certCount) // <-- NEW: Add to proxy's total.
 		m.Unlock()
 		return
 	}
@@ -154,28 +157,22 @@ func (m *ProxyManager) ReleaseClient(p *Proxy, success bool) {
 	if p.state == healthy && p.failures >= m.cfg.ProxyFailures {
 		p.state = unhealthy
 		m.logger.Error("Proxy has been marked as UNHEALTHY.", "proxy", p.URL, "cooldown", m.cfg.ProxyCooldown)
-		// Start the health-checking process with the initial cooldown.
 		go m.probeProxy(p, m.cfg.ProxyCooldown)
 	}
 }
 
-// probeProxy periodically checks an unhealthy proxy and attempts to revive it.
-// It implements an exponential backoff strategy.
+// probeProxy remains the same.
 func (m *ProxyManager) probeProxy(p *Proxy, currentCooldown time.Duration) {
-	// Wait for the cooldown period.
 	time.Sleep(currentCooldown)
 
 	m.logger.Info("Probing unhealthy proxy.", "proxy", p.URL)
 
-	// Build the health check URL (get-sth is a good, lightweight choice).
 	healthCheckURL, err := url.JoinPath(m.logURL, "ct/v1/get-sth")
 	if err != nil {
 		m.logger.Error("Could not create health check URL, proxy remains unhealthy.", "error", err)
-		// This is a permanent config error, so we just leave the proxy as unhealthy.
 		return
 	}
 
-	// Perform the health check using the proxy's own client.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", healthCheckURL, nil)
@@ -190,22 +187,20 @@ func (m *ProxyManager) probeProxy(p *Proxy, currentCooldown time.Duration) {
 	defer m.Unlock()
 
 	if probeSuccess {
-		// It's alive! Return it to the pool.
 		m.logger.Info("Proxy probe successful. Returning to healthy pool.", "proxy", p.URL)
 		p.state = healthy
 		p.failures = 0
 	} else {
-		// Probe failed. Increase cooldown and schedule the next probe.
 		nextCooldown := currentCooldown * 2
 		if nextCooldown > maxCooldown {
 			nextCooldown = maxCooldown
 		}
 		m.logger.Warn("Proxy probe failed. Retrying after longer cooldown.", "proxy", p.URL, "next_cooldown", nextCooldown)
-		go m.probeProxy(p, nextCooldown) // Recursively call with longer backoff
+		go m.probeProxy(p, nextCooldown)
 	}
 }
 
-// GetStatuses remains the same
+// GetStatuses now populates the cert count for each proxy.
 func (m *ProxyManager) GetStatuses() []ProxyStatus {
 	m.RLock()
 	defer m.RUnlock()
@@ -213,7 +208,8 @@ func (m *ProxyManager) GetStatuses() []ProxyStatus {
 	statuses := make([]ProxyStatus, len(m.proxies))
 	for i, p := range m.proxies {
 		status := ProxyStatus{
-			Failures: p.failures,
+			Failures:        p.failures,
+			CertsDownloaded: p.CertsDownloaded.Load(), // <-- NEW: Load the atomic value.
 		}
 		if p.URL != nil {
 			status.URL = p.URL.String()

@@ -58,7 +58,7 @@ func main() {
 	}
 	defer stateMgr.Close()
 
-	// Read the starting index from disk, which is now the source of truth.
+	// Read the starting index from disk.
 	startIndex, err := stateMgr.ReadState()
 	if err != nil {
 		logger.Error("Failed to read initial state.", "error", err)
@@ -74,7 +74,7 @@ func main() {
 		"concurrency_per_proxy", activeLog.DownloadJobs,
 		"job_size", activeLog.DownloadSize,
 		"batch_size", cfg.BatchSize,
-		"aggregator_buffer", cfg.AggregatorBufferSize, // <-- Log new config
+		"aggregator_buffer", cfg.AggregatorBufferSize,
 		"resume_from_index", startIndex,
 	)
 
@@ -82,7 +82,6 @@ func main() {
 	concurrency := activeLog.DownloadJobs
 	jobsChan := make(chan *ctlog.DownloadJob, concurrency*2)
 	resultsChan := make(chan *network.DownloadResult, concurrency*2)
-	// Make the formatted chan larger to accommodate the aggregator buffer
 	formattedChan := make(chan *processing.FormattedEntry, cfg.AggregatorBufferSize)
 
 	// --- Instantiate all pipeline components ---
@@ -95,10 +94,10 @@ func main() {
 		os.Exit(1)
 	}
 	formatterPool := processing.NewFormattingWorkerPool(resultsChan, formattedChan, logger)
-
-	// MODIFIED: Pass the buffer size and the accurate start index to the aggregator.
 	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, cfg.AggregatorBufferSize, startIndex, logger)
-	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager)
+
+	// MODIFIED: Pass the max buffer size to the display constructor.
+	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager, cfg.AggregatorBufferSize)
 
 	// =================================================================
 	//                       START THE PIPELINE & UI
