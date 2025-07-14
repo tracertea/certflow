@@ -4,6 +4,9 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"sync"
@@ -25,6 +28,13 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
+
+	go func() {
+		slog.Info("Starting profiling server on http://localhost:6060/debug/pprof")
+		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
+			slog.Error("Profiling server failed", "error", err)
+		}
+	}()
 
 	if err := os.MkdirAll(cfg.OutputDir, 0755); err != nil {
 		fmt.Fprintf(os.Stderr, "Fatal: Could not create output directory %s: %v\n", cfg.OutputDir, err)
@@ -97,7 +107,7 @@ func main() {
 	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, cfg.AggregatorBufferSize, startIndex, logger)
 
 	// MODIFIED: Pass the max buffer size to the display constructor.
-	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager, cfg.AggregatorBufferSize)
+	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager, cfg.AggregatorBufferSize, jobsChan, resultsChan, formattedChan)
 
 	// =================================================================
 	//                       START THE PIPELINE & UI

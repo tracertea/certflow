@@ -30,7 +30,13 @@ type Display struct {
 	sthPoller               *ctlog.STHPoller
 	aggregator              *processing.FileAggregator
 	proxyManager            *network.ProxyManager
-	maxAggregatorBufferSize int // <-- NEW: Store max buffer size
+	maxAggregatorBufferSize int
+
+	// --- NEW: Add channel fields ---
+	jobsChan      <-chan *ctlog.DownloadJob
+	resultsChan   <-chan *network.DownloadResult
+	formattedChan <-chan *processing.FormattedEntry
+	// --- End NEW ---
 
 	// For rolling average rate calculation
 	rateWindow  time.Duration
@@ -42,17 +48,30 @@ type Display struct {
 }
 
 // NewDisplay now accepts the max buffer size for display purposes.
-func NewDisplay(poller *ctlog.STHPoller, aggregator *processing.FileAggregator, proxyMgr *network.ProxyManager, maxBufferSize int) *Display {
+func NewDisplay(
+	poller *ctlog.STHPoller,
+	aggregator *processing.FileAggregator,
+	proxyMgr *network.ProxyManager,
+	maxBufferSize int,
+	jobsChan <-chan *ctlog.DownloadJob,
+	resultsChan <-chan *network.DownloadResult,
+	formattedChan <-chan *processing.FormattedEntry,
+) *Display {
+	// --- End NEW ---
 	return &Display{
 		sthPoller:               poller,
 		aggregator:              aggregator,
 		proxyManager:            proxyMgr,
-		maxAggregatorBufferSize: maxBufferSize, // <-- NEW
-		rateWindow:              60 * time.Second,
-		proxyHistory:            make(map[string][]rateDataPoint),
+		maxAggregatorBufferSize: maxBufferSize,
+		// --- NEW: Assign the channels ---
+		jobsChan:      jobsChan,
+		resultsChan:   resultsChan,
+		formattedChan: formattedChan,
+		// --- End NEW ---
+		rateWindow:   60 * time.Second,
+		proxyHistory: make(map[string][]rateDataPoint),
 	}
 }
-
 func (d *Display) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
 
@@ -73,17 +92,26 @@ func (d *Display) Run(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
+// In /internal/ui/display.go
+
 func (d *Display) render() {
+	// --- THIS SECTION IS NOW CORRECT ---
 	// Gather data
 	currentIndex := d.aggregator.LastSavedIndex()
 	totalSize := d.sthPoller.LatestTreeSize()
 	proxyStatuses := d.proxyManager.GetStatuses()
-	bufferSize := d.aggregator.PendingBufferSize() // <-- Get current buffer size
+	bufferSize := d.aggregator.PendingBufferSize()
+
+	// Get channel lengths and capacities
+	jobsLen, jobsCap := len(d.jobsChan), cap(d.jobsChan)
+	resultsLen, resultsCap := len(d.resultsChan), cap(d.resultsChan)
+	formattedLen, formattedCap := len(d.formattedChan), cap(d.formattedChan)
 
 	// Update and calculate rates
 	d.updateOverallRate(currentIndex)
 	proxyCpms := d.updateAndGetProxyCpms(proxyStatuses)
 	eta := d.calculateETA(currentIndex, totalSize)
+	// --- END CORRECTION ---
 
 	var sb strings.Builder
 	sb.WriteString("\033[H\033[2J")
@@ -97,12 +125,21 @@ func (d *Display) render() {
 	sb.WriteString(d.buildProgressBar(progress))
 	sb.WriteString("\n")
 
-	// Stats line MODIFIED to include buffer size
-	sb.WriteString(fmt.Sprintf("Rate (60s avg): %s%.0f certs/s%s | ETA: %s%s%s | Buffer: %s%d / %d%s\n\n",
+	// --- MERGED AND CORRECTED STATS AND QUEUE LINES ---
+	// Main stats line
+	sb.WriteString(fmt.Sprintf("Rate (60s avg): %s%.0f certs/s%s | ETA: %s%s%s\n",
 		colorBlue, d.currentRate, colorReset,
 		colorYellow, eta, colorReset,
+	))
+
+	// Queue status line
+	sb.WriteString(fmt.Sprintf("Queues: Jobs: %s%d/%d%s | Results: %s%d/%d%s | Formatted: %s%d/%d%s | Aggregator Buffer: %s%d/%d%s\n\n",
+		colorPurple, jobsLen, jobsCap, colorReset,
+		colorPurple, resultsLen, resultsCap, colorReset,
+		colorPurple, formattedLen, formattedCap, colorReset,
 		colorPurple, bufferSize, d.maxAggregatorBufferSize, colorReset,
 	))
+	// --- END CORRECTION ---
 
 	// Proxies
 	sb.WriteString("Proxy Status:\n")

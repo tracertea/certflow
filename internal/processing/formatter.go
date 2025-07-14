@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	"runtime"
@@ -13,8 +12,11 @@ import (
 
 	ct "github.com/google/certificate-transparency-go"
 	"github.com/google/certificate-transparency-go/tls"
+	jsoniter "github.com/json-iterator/go"
 	"github.com/tracertea/certflow/internal/network"
 )
+
+var json = jsoniter.ConfigCompatibleWithStandardLibrary
 
 // entriesResponse is the structure of the JSON received from a get-entries endpoint.
 type entriesResponse struct {
@@ -150,8 +152,8 @@ func (p *FormattingWorkerPool) worker(ctx context.Context, wg *sync.WaitGroup, i
 func (p *FormattingWorkerPool) processResult(ctx context.Context, result *network.DownloadResult) {
 	//p.logger.Debug("Formatter received result.", "start", result.Job.Start, "end", result.Job.End)
 
-	var response ct.GetEntriesResponse // Use the correct struct from the ct package
-	if err := json.Unmarshal(result.Data, &response); err != nil {
+	var response ct.GetEntriesResponse                             // Use the correct struct from the ct package
+	if err := json.Unmarshal(result.Data, &response); err != nil { // <-- This now uses the faster library
 		p.logger.Warn("Failed to unmarshal get-entries JSON.", "error", err, "start", result.Job.Start)
 		return
 	}
