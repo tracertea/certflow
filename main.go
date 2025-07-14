@@ -19,10 +19,9 @@ import (
 )
 
 func main() {
-	// Load configuration first to determine logging paths.
+	// Load configuration first.
 	cfg, err := config.Load()
 	if err != nil {
-		// Use a temporary basic logger for pre-init errors as we don't have the config path yet.
 		flag.Usage()
 		os.Exit(1)
 	}
@@ -32,18 +31,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Initialize the file-based, multi-writer logger.
+	// Initialize the logger.
 	logger, logFile := logging.New(cfg.OutputDir, cfg.LogFile)
 	if logFile != nil {
 		defer logFile.Close()
 	}
 
-	// Set up context for graceful shutdown.
+	// Set up graceful shutdown context.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
 
-	// Listen for OS signals (Ctrl+C).
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
@@ -60,14 +58,14 @@ func main() {
 	}
 	defer stateMgr.Close()
 
-	// Read the starting index from the last saved state.
+	// Read the starting index from disk, which is now the source of truth.
 	startIndex, err := stateMgr.ReadState()
 	if err != nil {
 		logger.Error("Failed to read initial state.", "error", err)
 		os.Exit(1)
 	}
 
-	// Log initial configuration details before the UI takes over the screen.
+	// Log initial configuration details.
 	activeLog := cfg.ActiveLog
 	logger.Info(
 		"Certflow starting.",
@@ -75,7 +73,8 @@ func main() {
 		"log_url", activeLog.URL,
 		"concurrency_per_proxy", activeLog.DownloadJobs,
 		"job_size", activeLog.DownloadSize,
-		"batch_size", cfg.BatchSize, // <-- Log the batch size
+		"batch_size", cfg.BatchSize,
+		"aggregator_buffer", cfg.AggregatorBufferSize, // <-- Log new config
 		"resume_from_index", startIndex,
 	)
 
@@ -83,39 +82,36 @@ func main() {
 	concurrency := activeLog.DownloadJobs
 	jobsChan := make(chan *ctlog.DownloadJob, concurrency*2)
 	resultsChan := make(chan *network.DownloadResult, concurrency*2)
-	formattedChan := make(chan *processing.FormattedEntry, concurrency*4)
+	// Make the formatted chan larger to accommodate the aggregator buffer
+	formattedChan := make(chan *processing.FormattedEntry, cfg.AggregatorBufferSize)
 
 	// --- Instantiate all pipeline components ---
 
 	sthPoller := ctlog.NewSTHPoller(activeLog.URL, logger)
 	jobGenerator := ctlog.NewJobGenerator(sthPoller, jobsChan, startIndex, activeLog.DownloadSize, cfg.Continuous, logger)
-
-	// UPDATED: Pass the active log URL to the proxy manager for health checks.
 	proxyManager, err := network.NewProxyManager(activeLog.URL, concurrency, cfg, logger)
 	if err != nil {
 		logger.Error("Failed to initialize proxy manager.", "error", err)
 		os.Exit(1)
 	}
-
 	formatterPool := processing.NewFormattingWorkerPool(resultsChan, formattedChan, logger)
 
-	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, logger)
+	// MODIFIED: Pass the buffer size and the accurate start index to the aggregator.
+	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, cfg.AggregatorBufferSize, startIndex, logger)
 	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager)
 
 	// =================================================================
 	//                       START THE PIPELINE & UI
 	// =================================================================
 
-	// Start all pipeline stages as goroutines.
 	wg.Add(1)
 	go sthPoller.Run(ctx, &wg)
 
 	wg.Add(1)
 	go jobGenerator.Run(ctx, &wg)
 
-	// Start the Download Worker Pool.
 	numWorkers := concurrency * len(cfg.Proxies)
-	if numWorkers == 0 { // Account for direct mode (no proxies)
+	if numWorkers == 0 {
 		numWorkers = concurrency
 	}
 	wg.Add(numWorkers)
@@ -130,16 +126,11 @@ func main() {
 	wg.Add(1)
 	go fileAggregator.Run(ctx, &wg)
 
-	// Start the UI renderer as the final goroutine.
 	wg.Add(1)
 	go display.Run(ctx, &wg)
 
-	// Wait for the shutdown signal (from the context being cancelled).
 	<-ctx.Done()
-
-	// Wait for all goroutines in the WaitGroup to finish their cleanup.
 	wg.Wait()
 
-	// The UI will be gone now, so this final log message will be visible in the console and log file.
 	logger.Info("Certflow has shut down gracefully.")
 }
