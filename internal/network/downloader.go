@@ -60,8 +60,6 @@ func (w *DownloadWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob) {
-	//w.logger.Debug("Worker received job.", "start", job.Start, "end", job.End)
-
 	getEntriesURL, err := url.Parse(w.logURL)
 	if err != nil {
 		w.logger.Error("Base log URL is invalid, dropping job.", "start", job.Start, "error", err)
@@ -75,7 +73,7 @@ func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob)
 
 	for attempt := 0; attempt < maxJobRetries; attempt++ {
 		if ctx.Err() != nil {
-			return
+			return // Exit if the application is shutting down.
 		}
 
 		if attempt > 0 {
@@ -89,46 +87,52 @@ func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob)
 			continue
 		}
 
+		// --- NEW, ROBUST RELEASE PATTERN ---
 		var success bool
-		// MODIFIED: The release func now takes the number of certs processed.
-		release := func(count uint64) { w.proxyManager.ReleaseClient(proxy, success, count) }
+		var certCountInJob uint64
+		var duration time.Duration
+		// Defer the release call. It will execute when the function returns,
+		// using the final values of the variables.
+		defer func() {
+			w.proxyManager.ReleaseClient(proxy, success, certCountInJob, duration)
+		}()
+		// --- END NEW ---
 
 		req, _ := http.NewRequestWithContext(ctx, "GET", getEntriesURL.String(), nil)
+
+		// Time the network request
+		startTime := time.Now()
 		resp, err := proxy.client.Do(req)
+		duration = time.Since(startTime)
+
 		if err != nil {
-			w.logger.Warn("Download attempt failed: http request error.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "error", err)
-			release(0) // Release with 0 certs on failure
-			continue
+			w.logger.Warn("Download attempt failed: http request error.", "start", job.Start, "proxy", proxy.URL, "error", err, "duration", duration)
+			continue // defer will run, releasing the client with success=false
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			w.logger.Warn("Download attempt failed: non-200 status.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "status", resp.StatusCode)
+			w.logger.Warn("Download attempt failed: non-200 status.", "start", job.Start, "proxy", proxy.URL, "status", resp.StatusCode, "duration", duration)
 			resp.Body.Close()
-			release(0) // Release with 0 certs on failure
-			continue
+			continue // defer will run, releasing the client with success=false
 		}
 
 		body, err := io.ReadAll(resp.Body)
 		resp.Body.Close()
 		if err != nil {
-			w.logger.Warn("Download attempt failed: could not read body.", "start", "job.Start", "attempt", attempt+1, "proxy", proxy.URL, "error", err)
-			release(0) // Release with 0 certs on failure
-			continue
+			w.logger.Warn("Download attempt failed: could not read body.", "start", job.Start, "proxy", proxy.URL, "error", err, "duration", duration)
+			continue // defer will run, releasing the client with success=false
 		}
 
 		// SUCCESS!
 		result := &DownloadResult{Job: job, Data: body}
 		select {
 		case w.resultsChan <- result:
-			success = true
-			// MODIFIED: On success, release with the actual number of certs in the job.
-			certCountInJob := (job.End - job.Start) + 1
-			release(certCountInJob)
-			//w.logger.Debug("Worker sent result to formatter.", "start", job.Start, "end", job.End)
-			return
+			success = true // Mark as success for the deferred release call.
+			certCountInJob = (job.End - job.Start) + 1
+			return // defer will run, releasing the client correctly.
 		case <-ctx.Done():
-			release(0) // Release with 0 certs if we are shutting down.
-			return
+			// Context cancelled while trying to send.
+			return // defer will run, releasing client with success=false.
 		}
 	}
 

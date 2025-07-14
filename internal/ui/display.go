@@ -121,7 +121,7 @@ func (d *Display) render() {
 	if totalSize > 0 {
 		progress = (float64(currentIndex) / float64(totalSize)) * 100
 	}
-	sb.WriteString(fmt.Sprintf("Progress: %s%.2f%%%s (%d / %d)\n", colorGreen, progress, colorReset, currentIndex, totalSize))
+	sb.WriteString(fmt.Sprintf("Progress: %s%.2f%%%s (%d / %d)\n", colorGreen, progress, colorReset, currentIndex+1, totalSize))
 	sb.WriteString(d.buildProgressBar(progress))
 	sb.WriteString("\n")
 
@@ -151,11 +151,16 @@ func (d *Display) render() {
 			stateColor = colorRed
 		}
 		cpm := proxyCpms[status.URL]
+		// Round for cleaner display
+		mean := status.Latency.Mean.Round(time.Millisecond)
+		p99 := status.Latency.P99.Round(time.Millisecond)
 
-		sb.WriteString(fmt.Sprintf("  [%s%8s%s] %s (failures: %d) | CPM: %s%.0f%s\n",
+		// --- MODIFIED: Display the mean and p99 latency ---
+		sb.WriteString(fmt.Sprintf("  [%s%8s%s] %s | CPM: %s%6.0f%s | Latency (avg/p99): %s%s/%s%s\n",
 			stateColor, status.State, colorReset,
-			status.URL, status.Failures,
+			status.URL,
 			colorPurple, cpm, colorReset,
+			colorYellow, mean, p99, colorReset,
 		))
 	}
 

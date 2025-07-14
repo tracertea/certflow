@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/HdrHistogram/hdrhistogram-go"
 	"github.com/tracertea/certflow/internal/config"
 )
 
@@ -30,6 +31,15 @@ type Proxy struct {
 	concurrencySlots chan struct{}
 	client           *http.Client
 	CertsDownloaded  atomic.Uint64 // <-- NEW: Tracks certs per proxy.
+	histogram        *hdrhistogram.Histogram
+}
+
+// NEW: A struct to hold the stats we extract from the histogram
+type LatencyStats struct {
+	Mean time.Duration
+	P95  time.Duration
+	P99  time.Duration
+	Max  time.Duration
 }
 
 // ProxyStatus includes the total cert count for UI display.
@@ -37,7 +47,8 @@ type ProxyStatus struct {
 	URL             string
 	State           string // "Healthy", "Unhealthy"
 	Failures        int
-	CertsDownloaded uint64 // <-- NEW: To pass total to UI.
+	CertsDownloaded uint64
+	Latency         LatencyStats
 }
 
 type ProxyManager struct {
@@ -94,6 +105,7 @@ func NewProxyManager(logURL string, concurrencyPerProxy int, cfg *config.Config,
 				Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)},
 				Timeout:   45 * time.Second,
 			},
+			histogram: hdrhistogram.New(1_000_000, 60_000_000_000, 3),
 		}
 		mgr.proxies = append(mgr.proxies, proxy)
 	}
@@ -134,7 +146,12 @@ func (m *ProxyManager) GetClient() (*Proxy, error) {
 }
 
 // ReleaseClient now accepts a certCount to update proxy stats on success.
-func (m *ProxyManager) ReleaseClient(p *Proxy, success bool, certCount uint64) {
+func (m *ProxyManager) ReleaseClient(p *Proxy, success bool, certCount uint64, duration time.Duration) {
+	if duration > 0 {
+		// It's good practice to ignore errors here in a hot path.
+		_ = p.histogram.RecordValue(duration.Nanoseconds())
+	}
+
 	defer func() {
 		p.concurrencySlots <- struct{}{}
 	}()
@@ -207,9 +224,17 @@ func (m *ProxyManager) GetStatuses() []ProxyStatus {
 
 	statuses := make([]ProxyStatus, len(m.proxies))
 	for i, p := range m.proxies {
+		stats := LatencyStats{
+			Mean: time.Duration(p.histogram.Mean()),
+			P95:  time.Duration(p.histogram.ValueAtQuantile(95)),
+			P99:  time.Duration(p.histogram.ValueAtQuantile(99)),
+			Max:  time.Duration(p.histogram.Max()),
+		}
+
 		status := ProxyStatus{
 			Failures:        p.failures,
-			CertsDownloaded: p.CertsDownloaded.Load(), // <-- NEW: Load the atomic value.
+			CertsDownloaded: p.CertsDownloaded.Load(),
+			Latency:         stats, // <-- Assign the calculated average
 		}
 		if p.URL != nil {
 			status.URL = p.URL.String()

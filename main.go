@@ -75,19 +75,14 @@ func main() {
 		os.Exit(1)
 	}
 
-	// --- CORRECTED: Clearer Concurrency and Channel Sizing ---
-
+	// --- Concurrency and Channel Sizing ---
 	activeLog := cfg.ActiveLog
-	// 1. Define the concurrency limit per proxy clearly. This is our primary constraint.
-	concurrencyPerProxy := activeLog.DownloadJobs // e.g., 4
-
-	// 2. Calculate the total possible concurrency of the entire download stage.
+	concurrencyPerProxy := activeLog.DownloadJobs
 	totalPossibleConcurrency := concurrencyPerProxy
 	if len(cfg.Proxies) > 0 {
-		totalPossibleConcurrency = concurrencyPerProxy * len(cfg.Proxies) // e.g., 4 * 10 proxies = 40
+		totalPossibleConcurrency = concurrencyPerProxy * len(cfg.Proxies)
 	}
 
-	// Log initial configuration details with the clearer variable names.
 	logger.Info(
 		"Certflow starting.",
 		"log_description", activeLog.Description,
@@ -100,24 +95,37 @@ func main() {
 		"resume_from_index", startIndex,
 	)
 
-	// 3. Size the pipeline channels based on the total possible concurrency.
-	// A buffer of 2x the total concurrency is a healthy size to prevent stalls.
-	jobsChan := make(chan *ctlog.DownloadJob, totalPossibleConcurrency*2)         // Capacity is now appropriately larger (e.g., 80)
-	resultsChan := make(chan *network.DownloadResult, totalPossibleConcurrency*2) // Capacity is now appropriately larger (e.g., 80)
+	// --- Create Pipeline Channels ---
+	jobsChan := make(chan *ctlog.DownloadJob, totalPossibleConcurrency*2)
+	resultsChan := make(chan *network.DownloadResult, totalPossibleConcurrency*2)
 	formattedChan := make(chan *processing.FormattedEntry, cfg.AggregatorBufferSize)
+	// Create a channel for completed batch files to be sent for compression.
+	gzipChan := make(chan string, 100)
 
 	// --- Instantiate all pipeline components ---
 
 	sthPoller := ctlog.NewSTHPoller(activeLog.URL, logger)
 	jobGenerator := ctlog.NewJobGenerator(sthPoller, jobsChan, startIndex, activeLog.DownloadSize, cfg.Continuous, logger)
-	// The ProxyManager is correctly initialized with the *per-proxy* limit.
 	proxyManager, err := network.NewProxyManager(activeLog.URL, concurrencyPerProxy, cfg, logger)
 	if err != nil {
 		logger.Error("Failed to initialize proxy manager.", "error", err)
 		os.Exit(1)
 	}
 	formatterPool := processing.NewFormattingWorkerPool(resultsChan, formattedChan, logger)
-	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, cfg.AggregatorBufferSize, startIndex, logger)
+	// Instantiate the new GZipper component.
+	gzipper := processing.NewGZipper(gzipChan, logger)
+	// Pass the new gzipChan to the FileAggregator constructor.
+	fileAggregator := processing.NewFileAggregator(
+		stateMgr,
+		formattedChan,
+		cfg.OutputDir,
+		cfg.BatchSize,
+		cfg.StateSaveTicker,
+		gzipChan, // <-- Pass the new channel
+		cfg.AggregatorBufferSize,
+		startIndex,
+		logger,
+	)
 	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager, cfg.AggregatorBufferSize, jobsChan, resultsChan, formattedChan)
 
 	// =================================================================
@@ -130,12 +138,9 @@ func main() {
 	wg.Add(1)
 	go jobGenerator.Run(ctx, &wg)
 
-	// --- CORRECTED: Worker pool is now a fixed, generous size. ---
-	// The ProxyManager will handle enforcing the per-proxy concurrency limit.
-	// These workers will block inside proxyManager.GetClient() until a slot is available.
+	// Worker pool is a fixed, generous size. The ProxyManager enforces per-proxy limits.
 	numWorkers := 100
 	logger.Info("Starting download worker pool", "worker_count", numWorkers)
-
 	wg.Add(numWorkers)
 	for i := 0; i < numWorkers; i++ {
 		worker := network.NewDownloadWorker(i, activeLog.URL, jobsChan, resultsChan, proxyManager, logger)
@@ -147,6 +152,10 @@ func main() {
 
 	wg.Add(1)
 	go fileAggregator.Run(ctx, &wg)
+
+	// Launch the GZipper goroutine.
+	wg.Add(1)
+	go gzipper.Run(ctx, &wg)
 
 	wg.Add(1)
 	go display.Run(ctx, &wg)
