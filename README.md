@@ -1,8 +1,8 @@
-# Certflow
+# certflow
 
 ## Overview
 
-Certflow is a Go-based tool designed for efficiently retrieving and processing certificates from Certificate Transparency logs. It utilizes concurrent operations, proxy management, and robust state handling for continuous, reliable certificate data processing.
+certflow is a Go-based tool designed for efficiently retrieving and processing certificates from Certificate Transparency logs. It utilizes concurrent operations, proxy management, and robust state handling for continuous, reliable certificate data processing.
 
 ## Features
 
