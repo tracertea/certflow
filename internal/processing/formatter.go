@@ -148,7 +148,7 @@ func (p *FormattingWorkerPool) worker(ctx context.Context, wg *sync.WaitGroup, i
 
 // processResult logic remains the same.
 func (p *FormattingWorkerPool) processResult(ctx context.Context, result *network.DownloadResult) {
-	p.logger.Debug("Formatter received result.", "start", result.Job.Start, "end", result.Job.End)
+	//p.logger.Debug("Formatter received result.", "start", result.Job.Start, "end", result.Job.End)
 
 	var response ct.GetEntriesResponse // Use the correct struct from the ct package
 	if err := json.Unmarshal(result.Data, &response); err != nil {

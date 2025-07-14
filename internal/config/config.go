@@ -18,8 +18,8 @@ func (s *stringSlice) Set(value string) error {
 
 // Config holds all configuration for the certflow application.
 type Config struct {
-	LogConfigPath string // <-- NEW: Path to the JSON file
-	ActiveLog     *Log   // <-- NEW: The specific log we are processing
+	LogConfigPath string // <-- Path to the JSON file
+	ActiveLog     *Log   // <-- The specific log we are processing
 
 	OutputDir       string
 	Continuous      bool
@@ -28,6 +28,7 @@ type Config struct {
 	LogFile         string
 	ProxyFailures   int
 	ProxyCooldown   time.Duration
+	BatchSize       uint64 // <-- NEW: Configurable batch size
 }
 
 // Load parses config and flags, it now requires the path to a log JSON config.
@@ -45,7 +46,8 @@ func Load() (*Config, error) {
 	flag.StringVar(&cfg.LogFile, "log-file", "debug.log", "Name of the log file to write to within the output directory. Set to empty to disable.")
 	flag.Var(&proxies, "proxies", "Comma-separated list of HTTP/S proxies to use (e.g., http://p1:8080,http://p2:8080).")
 	flag.IntVar(&cfg.ProxyFailures, "proxy-max-failures", 5, "Number of consecutive failures before a proxy is put on cooldown.")
-	flag.DurationVar(&cfg.ProxyCooldown, "proxy-cooldown", 1*time.Minute, "Duration a failing proxy is removed from the pool.")
+	flag.DurationVar(&cfg.ProxyCooldown, "proxy-cooldown", 1*time.Minute, "Initial duration a failing proxy is removed from the pool.")
+	flag.Uint64Var(&cfg.BatchSize, "batch-size", 100000, "Number of certificates to store in each output file.") // <-- NEW FLAG
 
 	flag.Parse()
 	cfg.Proxies = proxies

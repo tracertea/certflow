@@ -65,7 +65,7 @@ func (w *DownloadWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob) {
 	// Add this log line to see when a worker picks up a job.
-	w.logger.Debug("Worker received job.", "start", job.Start, "end", job.End)
+	//w.logger.Debug("Worker received job.", "start", job.Start, "end", job.End)
 
 	getEntriesURL, err := url.Parse(w.logURL)
 	if err != nil {
@@ -131,7 +131,7 @@ func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob)
 			success = true
 			release()
 			// Add a success log line.
-			w.logger.Debug("Worker sent result to formatter.", "start", job.Start, "end", job.End)
+			//w.logger.Debug("Worker sent result to formatter.", "start", job.Start, "end", job.End)
 			return
 		case <-ctx.Done():
 			release()

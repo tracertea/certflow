@@ -75,10 +75,11 @@ func main() {
 		"log_url", activeLog.URL,
 		"concurrency_per_proxy", activeLog.DownloadJobs,
 		"job_size", activeLog.DownloadSize,
+		"batch_size", cfg.BatchSize, // <-- Log the batch size
 		"resume_from_index", startIndex,
 	)
 
-	// Create pipeline channels. The requeueChan has been removed.
+	// Create pipeline channels.
 	concurrency := activeLog.DownloadJobs
 	jobsChan := make(chan *ctlog.DownloadJob, concurrency*2)
 	resultsChan := make(chan *network.DownloadResult, concurrency*2)
@@ -88,14 +89,17 @@ func main() {
 
 	sthPoller := ctlog.NewSTHPoller(activeLog.URL, logger)
 	jobGenerator := ctlog.NewJobGenerator(sthPoller, jobsChan, startIndex, activeLog.DownloadSize, cfg.Continuous, logger)
-	proxyManager, err := network.NewProxyManager(concurrency, cfg, logger)
+
+	// UPDATED: Pass the active log URL to the proxy manager for health checks.
+	proxyManager, err := network.NewProxyManager(activeLog.URL, concurrency, cfg, logger)
 	if err != nil {
 		logger.Error("Failed to initialize proxy manager.", "error", err)
 		os.Exit(1)
 	}
+
 	formatterPool := processing.NewFormattingWorkerPool(resultsChan, formattedChan, logger)
-	outputBatchSize := uint64(100000)
-	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, outputBatchSize, cfg.StateSaveTicker, logger)
+
+	fileAggregator := processing.NewFileAggregator(stateMgr, formattedChan, cfg.OutputDir, cfg.BatchSize, cfg.StateSaveTicker, logger)
 	display := ui.NewDisplay(sthPoller, fileAggregator, proxyManager)
 
 	// =================================================================
@@ -109,7 +113,7 @@ func main() {
 	wg.Add(1)
 	go jobGenerator.Run(ctx, &wg)
 
-	// Start the Download Worker Pool. Note the simplified constructor call.
+	// Start the Download Worker Pool.
 	numWorkers := concurrency * len(cfg.Proxies)
 	if numWorkers == 0 { // Account for direct mode (no proxies)
 		numWorkers = concurrency
