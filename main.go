@@ -4,9 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"log/slog"
-	"net/http"
-	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath" // Make sure filepath is imported
@@ -29,13 +26,6 @@ func main() {
 		flag.Usage()
 		os.Exit(1)
 	}
-
-	go func() {
-		slog.Info("Starting profiling server on http://localhost:6060/debug/pprof")
-		if err := http.ListenAndServe("localhost:6060", nil); err != nil {
-			slog.Error("Profiling server failed", "error", err)
-		}
-	}()
 
 	// --- NEW: Define the log-specific base directory ---
 	activeLog := cfg.ActiveLog
