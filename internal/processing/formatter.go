@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -12,6 +11,8 @@ import (
 	"strconv"
 	"sync"
 
+	ct "github.com/google/certificate-transparency-go"
+	"github.com/google/certificate-transparency-go/tls"
 	"github.com/tracertea/certflow/internal/network"
 )
 
@@ -25,9 +26,7 @@ type entriesResponse struct {
 // FormattedEntry holds a single line ready to be written to a batch file.
 type FormattedEntry struct {
 	LogIndex uint64
-	// Using a buffer from a sync.Pool is more efficient than a string
-	// for high-throughput scenarios as it reduces allocations.
-	Buffer *bytes.Buffer
+	Buffer   *bytes.Buffer
 }
 
 // bufferPool helps reuse buffers to reduce garbage collection pressure.
@@ -38,68 +37,60 @@ var bufferPool = sync.Pool{
 }
 
 var (
-	ErrInvalidMerkleLeaf   = errors.New("invalid merkle tree leaf")
-	ErrUnknownLogEntryType = errors.New("unknown log entry type")
+	ErrLogEntryUnsupported = errors.New("unsupported log entry type")
 )
 
-func extractCertificateFromLeaf(leafInput string) ([]byte, error) {
-	rawLeaf, err := base64.StdEncoding.DecodeString(leafInput)
+// extractCertificateFromLeaf uses the official CT library to parse the leaf.
+func extractCertificateData(leafInput string) (derBytes []byte, entryType ct.LogEntryType, err error) {
+	leafBytes, err := base64.StdEncoding.DecodeString(leafInput)
 	if err != nil {
+		return nil, 0, err
+	}
+
+	var leaf ct.MerkleTreeLeaf
+	if _, err := tls.Unmarshal(leafBytes, &leaf); err != nil {
+		return nil, 0, err
+	}
+
+	entryType = leaf.TimestampedEntry.EntryType
+	switch entryType {
+	case ct.X509LogEntryType:
+		derBytes = leaf.TimestampedEntry.X509Entry.Data
+	case ct.PrecertLogEntryType:
+		derBytes = leaf.TimestampedEntry.PrecertEntry.TBSCertificate
+	default:
+		err = ErrLogEntryUnsupported
+	}
+	return
+}
+
+// getFinalCertificateDer correctly reconstructs the final certificate using the
+// available library functions from the provided ct.go source.
+func getFinalCertificateDer(entry ct.LeafEntry) ([]byte, error) {
+	// First, we always need to parse the leaf_input to determine the entry type.
+	var leaf ct.MerkleTreeLeaf
+	if _, err := tls.Unmarshal(entry.LeafInput, &leaf); err != nil {
 		return nil, err
 	}
 
-	if len(rawLeaf) < 2 { // Need at least version and leaf type
-		return nil, ErrInvalidMerkleLeaf
-	}
-	// version := rawLeaf[0]
-	leafType := rawLeaf[1]
-	if leafType != 0 { // 0 = timestamped_entry
-		return nil, ErrInvalidMerkleLeaf
-	}
+	switch leaf.TimestampedEntry.EntryType {
+	case ct.X509LogEntryType:
+		// For a standard certificate, the data is in the leaf input.
+		return leaf.TimestampedEntry.X509Entry.Data, nil
 
-	// We have a timestamped entry, so we need at least 12 bytes total for the header.
-	if len(rawLeaf) < 12 {
-		return nil, ErrInvalidMerkleLeaf
-	}
-
-	entryType := binary.BigEndian.Uint16(rawLeaf[10:12])
-
-	var certBytes []byte
-	var certLenOffset int
-
-	// CORRECTED: Handle both x509_entry and precert_entry
-	switch entryType {
-	case 0: // x509_entry
-		certLenOffset = 12 // Length starts after timestamp(8) + entry_type(2)
-		if len(rawLeaf) < certLenOffset+3 {
-			return nil, ErrInvalidMerkleLeaf
+	case ct.PrecertLogEntryType:
+		// For a precertificate, the final "poisoned" cert is in the extra_data field.
+		// We must unmarshal extra_data as a PrecertChainEntry.
+		var chainEntry ct.PrecertChainEntry
+		if _, err := tls.Unmarshal(entry.ExtraData, &chainEntry); err != nil {
+			return nil, err
 		}
-		certLen := uint32(rawLeaf[certLenOffset])<<16 | uint32(rawLeaf[certLenOffset+1])<<8 | uint32(rawLeaf[certLenOffset+2])
-		certStart := certLenOffset + 3
-		if len(rawLeaf) < certStart+int(certLen) {
-			return nil, ErrInvalidMerkleLeaf
-		}
-		certBytes = rawLeaf[certStart : certStart+int(certLen)]
-
-	case 1: // precert_entry
-		// A precert has a 32-byte issuer key hash before the certificate data.
-		// We skip the hash to get to the certificate.
-		certLenOffset = 12 + 32 // Length starts after timestamp(8) + entry_type(2) + issuer_key_hash(32)
-		if len(rawLeaf) < certLenOffset+3 {
-			return nil, ErrInvalidMerkleLeaf
-		}
-		certLen := uint32(rawLeaf[certLenOffset])<<16 | uint32(rawLeaf[certLenOffset+1])<<8 | uint32(rawLeaf[certLenOffset+2])
-		certStart := certLenOffset + 3
-		if len(rawLeaf) < certStart+int(certLen) {
-			return nil, ErrInvalidMerkleLeaf
-		}
-		certBytes = rawLeaf[certStart : certStart+int(certLen)]
+		// The PreCertificate field contains the ASN1Cert we need.
+		return chainEntry.PreCertificate.Data, nil
 
 	default:
-		return nil, ErrUnknownLogEntryType
+		return nil, ErrLogEntryUnsupported
 	}
-
-	return certBytes, nil
 }
 
 // FormattingWorkerPool manages a pool of goroutines that format raw download results.
@@ -118,14 +109,14 @@ func NewFormattingWorkerPool(resultsChan <-chan *network.DownloadResult, formatt
 	}
 }
 
-// Run starts the formatting workers. The number of workers is based on the number of available CPU cores.
+// Run starts the formatting workers.
 func (p *FormattingWorkerPool) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
-	defer close(p.formattedChan) // Close downstream channel when this stage is done.
+	defer close(p.formattedChan)
 
 	numWorkers := runtime.NumCPU()
 	if numWorkers < 2 {
-		numWorkers = 2 // Ensure at least 2 workers
+		numWorkers = 2
 	}
 	p.logger.Info("Starting formatting worker pool.", "worker_count", numWorkers)
 
@@ -146,22 +137,20 @@ func (p *FormattingWorkerPool) worker(ctx context.Context, wg *sync.WaitGroup, i
 		select {
 		case result, ok := <-p.resultsChan:
 			if !ok {
-				// resultsChan is closed, so we are done.
 				return
 			}
 			p.processResult(ctx, result)
 		case <-ctx.Done():
-			// Shutdown signal received.
 			return
 		}
 	}
 }
 
-// processResult now uses the improved extraction function.
+// processResult logic remains the same.
 func (p *FormattingWorkerPool) processResult(ctx context.Context, result *network.DownloadResult) {
 	p.logger.Debug("Formatter received result.", "start", result.Job.Start, "end", result.Job.End)
 
-	var response entriesResponse
+	var response ct.GetEntriesResponse // Use the correct struct from the ct package
 	if err := json.Unmarshal(result.Data, &response); err != nil {
 		p.logger.Warn("Failed to unmarshal get-entries JSON.", "error", err, "start", result.Job.Start)
 		return
@@ -169,10 +158,10 @@ func (p *FormattingWorkerPool) processResult(ctx context.Context, result *networ
 
 	currentIndex := result.Job.Start
 	for _, entry := range response.Entries {
-		certBytes, err := extractCertificateFromLeaf(entry.LeafInput)
+		// Pass the entire entry struct, which contains both leaf_input and extra_data.
+		derBytes, err := getFinalCertificateDer(entry)
 		if err != nil {
-			// This is now normal behavior for unknown log types, so we use Debug level.
-			p.logger.Debug("Skipping entry: could not extract certificate.", "index", currentIndex, "reason", err.Error())
+			p.logger.Debug("Skipping entry: could not process leaf.", "index", currentIndex, "reason", err.Error())
 			currentIndex++
 			continue
 		}
@@ -183,7 +172,7 @@ func (p *FormattingWorkerPool) processResult(ctx context.Context, result *networ
 		buf.WriteByte(' ')
 
 		encoder := base64.NewEncoder(base64.StdEncoding, buf)
-		encoder.Write(certBytes)
+		encoder.Write(derBytes)
 		encoder.Close()
 
 		formatted := FormattedEntry{
