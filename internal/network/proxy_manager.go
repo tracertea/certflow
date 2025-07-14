@@ -72,6 +72,9 @@ func NewProxyManager(concurrencyPerProxy int, cfg *config.Config, logger *slog.L
 
 	logger.Info("Initializing proxy pool.", "count", len(cfg.Proxies))
 	for _, proxyStr := range cfg.Proxies {
+		if proxyStr == "" {
+			continue
+		}
 		proxyURL, err := url.Parse(proxyStr)
 		if err != nil {
 			logger.Warn("Could not parse proxy URL, skipping.", "url", proxyStr, "error", err)

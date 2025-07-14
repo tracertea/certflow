@@ -7,62 +7,48 @@ import (
 	"time"
 )
 
-// DownloadJob now includes a retry counter.
+// DownloadJob no longer needs the Retries field here, as the worker handles it internally.
 type DownloadJob struct {
-	Start   uint64
-	End     uint64
-	Retries int // <-- NEW
+	Start uint64
+	End   uint64
 }
 
-// JobGenerator now manages requeued jobs.
+// JobGenerator is now simplified, without the requeue channel or retry logic.
 type JobGenerator struct {
 	logger       *slog.Logger
 	sthPoller    *STHPoller
 	jobsChan     chan<- *DownloadJob
-	requeueChan  <-chan *DownloadJob // <-- NEW: Receives failed jobs
 	nextIndex    uint64
 	downloadSize uint64
 	isContinuous bool
-	maxRetries   int // <-- NEW
 }
 
-// NewJobGenerator has a new signature.
-func NewJobGenerator(sthPoller *STHPoller, jobsChan chan<- *DownloadJob, requeueChan <-chan *DownloadJob, startIndex, downloadSize uint64, isContinuous bool, logger *slog.Logger) *JobGenerator {
+// NewJobGenerator has the corrected, simpler signature.
+func NewJobGenerator(sthPoller *STHPoller, jobsChan chan<- *DownloadJob, startIndex, downloadSize uint64, isContinuous bool, logger *slog.Logger) *JobGenerator {
 	return &JobGenerator{
 		logger:       logger.With("component", "job_generator"),
 		sthPoller:    sthPoller,
 		jobsChan:     jobsChan,
-		requeueChan:  requeueChan,
 		nextIndex:    startIndex,
 		downloadSize: downloadSize,
 		isContinuous: isContinuous,
-		maxRetries:   5, // Allow up to 5 retries for a job.
 	}
 }
 
-// Run is now more complex, using a select to handle new jobs and retries.
+// Run is now back to its simpler form. It only generates new jobs.
 func (g *JobGenerator) Run(ctx context.Context, wg *sync.WaitGroup) {
 	defer wg.Done()
+	// When the generator is done, close the jobs channel to signal to workers.
 	defer close(g.jobsChan)
 
 	g.logger.Info("Starting Job Generator.", "start_index", g.nextIndex, "job_size", g.downloadSize)
 
-	for {
-		// Priority 1: Always try to process a requeued job first.
-		select {
-		case job := <-g.requeueChan:
-			if job.Retries < g.maxRetries {
-				g.logger.Warn("Requeuing job.", "start", job.Start, "end", job.End, "retries", job.Retries)
-				g.jobsChan <- job // Send it back to the workers
-			} else {
-				g.logger.Error("Job failed permanently after max retries.", "start", job.Start, "end", job.End)
-			}
-			continue // Go back to the top of the loop to check for more requeued jobs.
-		default:
-			// No requeued jobs waiting, proceed with normal logic.
-		}
+	// This is a simple ticker to prevent a fast-spinning loop when caught up.
+	idleTicker := time.NewTicker(5 * time.Second)
+	defer idleTicker.Stop()
 
-		// Priority 2: Check for shutdown.
+	for {
+		// Check for shutdown signal first.
 		select {
 		case <-ctx.Done():
 			g.logger.Info("Stopping Job Generator.")
@@ -72,44 +58,39 @@ func (g *JobGenerator) Run(ctx context.Context, wg *sync.WaitGroup) {
 
 		latestTreeSize := g.sthPoller.LatestTreeSize()
 		if latestTreeSize == 0 {
-			time.Sleep(2 * time.Second)
+			time.Sleep(2 * time.Second) // Wait for the first STH poll to succeed.
 			continue
 		}
 
 		if g.nextIndex >= latestTreeSize {
 			if !g.isContinuous {
-				g.logger.Info("Caught up to tree head. Shutting down.")
+				g.logger.Info("Caught up to tree head in fixed-range mode. Shutting down.")
 				return
 			}
-			// Wait for new certs or a requeued job.
+
+			// We are caught up. Wait for the next tick or for shutdown.
 			select {
-			case job := <-g.requeueChan:
-				if job.Retries < g.maxRetries {
-					g.logger.Warn("Requeuing job.", "start", job.Start, "end", job.End, "retries", job.Retries)
-					g.jobsChan <- job
-				} else {
-					g.logger.Error("Job failed permanently after max retries.", "start", job.Start, "end", job.End)
-				}
-			case <-time.After(5 * time.Second):
-				// Waited long enough, loop again to check STH.
+			case <-idleTicker.C:
+				continue
 			case <-ctx.Done():
-				return // Shutdown
+				return
 			}
-			continue
 		}
 
-		// Priority 3: Generate a new job.
+		// Calculate job range.
 		end := g.nextIndex + g.downloadSize - 1
 		if end >= latestTreeSize {
 			end = latestTreeSize - 1
 		}
 
-		job := &DownloadJob{Start: g.nextIndex, End: end, Retries: 0}
+		job := &DownloadJob{Start: g.nextIndex, End: end}
 
+		// Send the new job, but respect the shutdown signal.
 		select {
 		case g.jobsChan <- job:
 			g.nextIndex = end + 1
 		case <-ctx.Done():
+			// Don't log here, the main shutdown message is sufficient.
 			return
 		}
 	}

@@ -8,9 +8,12 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"time"
 
 	"github.com/tracertea/certflow/internal/ctlog"
 )
+
+const maxJobRetries = 10
 
 // DownloadResult holds the raw data from a successful get-entries request.
 type DownloadResult struct {
@@ -24,19 +27,17 @@ type DownloadWorker struct {
 	logURL       string
 	jobsChan     <-chan *ctlog.DownloadJob
 	resultsChan  chan<- *DownloadResult
-	requeueChan  chan<- *ctlog.DownloadJob
 	proxyManager *ProxyManager
 	logger       *slog.Logger
 }
 
 // NewDownloadWorker creates a new worker.
-func NewDownloadWorker(id int, logURL string, jobsChan <-chan *ctlog.DownloadJob, resultsChan chan<- *DownloadResult, requeueChan chan<- *ctlog.DownloadJob, proxyMgr *ProxyManager, logger *slog.Logger) *DownloadWorker {
+func NewDownloadWorker(id int, logURL string, jobsChan <-chan *ctlog.DownloadJob, resultsChan chan<- *DownloadResult, proxyMgr *ProxyManager, logger *slog.Logger) *DownloadWorker {
 	return &DownloadWorker{
 		id:           id,
 		logURL:       logURL,
 		jobsChan:     jobsChan,
 		resultsChan:  resultsChan,
-		requeueChan:  requeueChan,
 		proxyManager: proxyMgr,
 		logger:       logger.With("worker_id", id),
 	}
@@ -63,76 +64,81 @@ func (w *DownloadWorker) Run(ctx context.Context, wg *sync.WaitGroup) {
 }
 
 func (w *DownloadWorker) processJob(ctx context.Context, job *ctlog.DownloadJob) {
-	// 1. Get a proxy client. This call will block until one is available.
-	proxy, err := w.proxyManager.GetClient()
-	if err != nil {
-		w.logger.Error("Failed to get a proxy client.", "error", err)
-		job.Retries++
-		w.requeueJob(ctx, job)
-		return
-	}
+	// Add this log line to see when a worker picks up a job.
+	w.logger.Debug("Worker received job.", "start", job.Start, "end", job.End)
 
-	// 2. Defer the release of the client, reporting success or failure.
-	var success bool
-	defer func() {
-		w.proxyManager.ReleaseClient(proxy, success)
-	}()
-
-	// 3. Build the request URL.
 	getEntriesURL, err := url.Parse(w.logURL)
 	if err != nil {
-		w.logger.Error("Base log URL is invalid.", "url", w.logURL, "error", err)
+		w.logger.Error("Base log URL is invalid, dropping job.", "start", job.Start, "error", err)
 		return
 	}
-	getEntriesURL, _ = getEntriesURL.Parse("ct/v1/get-entries") // Appending path
+	getEntriesURL, _ = getEntriesURL.Parse("ct/v1/get-entries")
 	q := getEntriesURL.Query()
 	q.Set("start", fmt.Sprint(job.Start))
 	q.Set("end", fmt.Sprint(job.End))
 	getEntriesURL.RawQuery = q.Encode()
 
-	// 4. Execute the request.
-	req, _ := http.NewRequestWithContext(ctx, "GET", getEntriesURL.String(), nil)
-	resp, err := proxy.client.Do(req)
-	if err != nil {
-		w.logger.Warn("get-entries request failed, will retry.", "start", job.Start, "proxy", proxy.URL, "error", err)
-		job.Retries++
-		w.requeueJob(ctx, job)
-		return // success remains false
-	}
-	defer resp.Body.Close()
+	for attempt := 0; attempt < maxJobRetries; attempt++ {
+		if ctx.Err() != nil {
+			return
+		}
 
-	if resp.StatusCode != http.StatusOK {
-		w.logger.Warn("get-entries non-200 status, will retry.", "status", resp.StatusCode, "proxy", proxy.URL)
-		job.Retries++
-		w.requeueJob(ctx, job)
-		return // success remains false
+		if attempt > 0 {
+			w.logger.Warn("Retrying job.", "start", job.Start, "attempt", attempt+1)
+			time.Sleep(time.Duration(attempt) * 2 * time.Second)
+		}
+
+		proxy, err := w.proxyManager.GetClient()
+		if err != nil {
+			// Add detailed logging for this specific failure case.
+			w.logger.Warn("Download attempt failed: could not get proxy.", "start", job.Start, "attempt", attempt+1, "error", err)
+			continue
+		}
+
+		var success bool
+		release := func() { w.proxyManager.ReleaseClient(proxy, success) }
+
+		req, _ := http.NewRequestWithContext(ctx, "GET", getEntriesURL.String(), nil)
+		resp, err := proxy.client.Do(req)
+		if err != nil {
+			// Add detailed logging
+			w.logger.Warn("Download attempt failed: http request error.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "error", err)
+			release()
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			// Add detailed logging
+			w.logger.Warn("Download attempt failed: non-200 status.", "start", job.Start, "attempt", attempt+1, "proxy", proxy.URL, "status", resp.StatusCode)
+			resp.Body.Close()
+			release()
+			continue
+		}
+
+		body, err := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if err != nil {
+			// Add detailed logging
+			w.logger.Warn("Download attempt failed: could not read body.", "start", "job.Start", "attempt", attempt+1, "proxy", proxy.URL, "error", err)
+			release()
+			continue
+		}
+
+		// SUCCESS!
+		result := &DownloadResult{Job: job, Data: body}
+		select {
+		case w.resultsChan <- result:
+			success = true
+			release()
+			// Add a success log line.
+			w.logger.Debug("Worker sent result to formatter.", "start", job.Start, "end", job.End)
+			return
+		case <-ctx.Done():
+			release()
+			return
+		}
 	}
 
-	// 5. Read the response body.
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		w.logger.Warn("Failed to read response body, will retry.", "proxy", proxy.URL, "error", err)
-		job.Retries++
-		w.requeueJob(ctx, job)
-		return // success remains false
-	}
-
-	// 6. Success! Send the result to the next stage.
-	result := &DownloadResult{Job: job, Data: body}
-	select {
-	case w.resultsChan <- result:
-		success = true // Mark as successful only after sending
-	case <-ctx.Done():
-		w.logger.Info("Shutdown during result send.")
-	}
-}
-
-// requeueJob is a new helper to safely send to the requeue channel.
-func (w *DownloadWorker) requeueJob(ctx context.Context, job *ctlog.DownloadJob) {
-	select {
-	case w.requeueChan <- job:
-		// Job successfully requeued.
-	case <-ctx.Done():
-		w.logger.Warn("Shutdown occurred, could not requeue failed job.", "start", job.Start, "end", job.End)
-	}
+	// This is the most important log line for finding lost data.
+	w.logger.Error("CRITICAL: Job failed permanently and was dropped.", "start", job.Start, "end", job.End)
 }

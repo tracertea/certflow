@@ -38,61 +38,67 @@ var bufferPool = sync.Pool{
 }
 
 var (
-	ErrInvalidMerkleLeaf = errors.New("invalid merkle tree leaf")
-	ErrNotX509Entry      = errors.New("log entry is not an x509 certificate")
+	ErrInvalidMerkleLeaf   = errors.New("invalid merkle tree leaf")
+	ErrUnknownLogEntryType = errors.New("unknown log entry type")
 )
 
-// extractCertificateFromLeaf decodes the leaf_input and parses the MerkleTreeLeaf
-// structure to extract the raw ASN.1 DER-encoded certificate.
-// See RFC 6962, Section 3.4.
 func extractCertificateFromLeaf(leafInput string) ([]byte, error) {
-	// 1. Base64 decode the leaf_input.
 	rawLeaf, err := base64.StdEncoding.DecodeString(leafInput)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2. Parse the MerkleTreeLeaf structure.
-	// struct {
-	//     Version                uint8
-	//     MerkleLeafType         uint8
-	//     TimestampedEntry       // variable
-	// } MerkleTreeLeaf;
-	if len(rawLeaf) < 11 { // Basic sanity check for length
+	if len(rawLeaf) < 2 { // Need at least version and leaf type
 		return nil, ErrInvalidMerkleLeaf
 	}
-
-	leafVersion := rawLeaf[0]
+	// version := rawLeaf[0]
 	leafType := rawLeaf[1]
-	if leafVersion != 0 || leafType != 0 { // We only care about TimestampedEntry leaves
+	if leafType != 0 { // 0 = timestamped_entry
 		return nil, ErrInvalidMerkleLeaf
 	}
 
-	// 3. Parse the TimestampedEntry structure.
-	// struct {
-	//     Timestamp              uint64
-	//     LogEntryType           uint16
-	//     select (entry_type) {
-	//         case x509_entry:      ASN.1Cert;
-	//         case precert_entry:   PrecertEntry;
-	//     } entry;
-	// } TimestampedEntry;
-	// We skip the 8-byte timestamp (bytes 2-9)
+	// We have a timestamped entry, so we need at least 12 bytes total for the header.
+	if len(rawLeaf) < 12 {
+		return nil, ErrInvalidMerkleLeaf
+	}
+
 	entryType := binary.BigEndian.Uint16(rawLeaf[10:12])
-	if entryType != 0 { // 0 = x509_entry
-		return nil, ErrNotX509Entry
+
+	var certBytes []byte
+	var certLenOffset int
+
+	// CORRECTED: Handle both x509_entry and precert_entry
+	switch entryType {
+	case 0: // x509_entry
+		certLenOffset = 12 // Length starts after timestamp(8) + entry_type(2)
+		if len(rawLeaf) < certLenOffset+3 {
+			return nil, ErrInvalidMerkleLeaf
+		}
+		certLen := uint32(rawLeaf[certLenOffset])<<16 | uint32(rawLeaf[certLenOffset+1])<<8 | uint32(rawLeaf[certLenOffset+2])
+		certStart := certLenOffset + 3
+		if len(rawLeaf) < certStart+int(certLen) {
+			return nil, ErrInvalidMerkleLeaf
+		}
+		certBytes = rawLeaf[certStart : certStart+int(certLen)]
+
+	case 1: // precert_entry
+		// A precert has a 32-byte issuer key hash before the certificate data.
+		// We skip the hash to get to the certificate.
+		certLenOffset = 12 + 32 // Length starts after timestamp(8) + entry_type(2) + issuer_key_hash(32)
+		if len(rawLeaf) < certLenOffset+3 {
+			return nil, ErrInvalidMerkleLeaf
+		}
+		certLen := uint32(rawLeaf[certLenOffset])<<16 | uint32(rawLeaf[certLenOffset+1])<<8 | uint32(rawLeaf[certLenOffset+2])
+		certStart := certLenOffset + 3
+		if len(rawLeaf) < certStart+int(certLen) {
+			return nil, ErrInvalidMerkleLeaf
+		}
+		certBytes = rawLeaf[certStart : certStart+int(certLen)]
+
+	default:
+		return nil, ErrUnknownLogEntryType
 	}
 
-	// The certificate length is a 3-byte uint24.
-	certLen := uint32(rawLeaf[12])<<16 | uint32(rawLeaf[13])<<8 | uint32(rawLeaf[14])
-
-	// Check if the indicated length is valid given the slice size.
-	if len(rawLeaf) < 15+int(certLen) {
-		return nil, ErrInvalidMerkleLeaf
-	}
-
-	// The certificate is the payload after this header.
-	certBytes := rawLeaf[15 : 15+certLen]
 	return certBytes, nil
 }
 
@@ -151,7 +157,10 @@ func (p *FormattingWorkerPool) worker(ctx context.Context, wg *sync.WaitGroup, i
 	}
 }
 
+// processResult now uses the improved extraction function.
 func (p *FormattingWorkerPool) processResult(ctx context.Context, result *network.DownloadResult) {
+	p.logger.Debug("Formatter received result.", "start", result.Job.Start, "end", result.Job.End)
+
 	var response entriesResponse
 	if err := json.Unmarshal(result.Data, &response); err != nil {
 		p.logger.Warn("Failed to unmarshal get-entries JSON.", "error", err, "start", result.Job.Start)
@@ -160,27 +169,23 @@ func (p *FormattingWorkerPool) processResult(ctx context.Context, result *networ
 
 	currentIndex := result.Job.Start
 	for _, entry := range response.Entries {
-		// 1. Extract the raw DER certificate bytes.
 		certBytes, err := extractCertificateFromLeaf(entry.LeafInput)
 		if err != nil {
-			// This is expected for precerts, so we just skip them.
+			// This is now normal behavior for unknown log types, so we use Debug level.
+			p.logger.Debug("Skipping entry: could not extract certificate.", "index", currentIndex, "reason", err.Error())
 			currentIndex++
 			continue
 		}
 
-		// 2. Get a buffer and write the log index.
 		buf := bufferPool.Get().(*bytes.Buffer)
 		buf.Reset()
 		buf.WriteString(strconv.FormatUint(currentIndex, 10))
 		buf.WriteByte(' ')
 
-		// 3. Base64-encode the raw certificate bytes directly into the buffer.
-		// This avoids the PEM headers entirely.
 		encoder := base64.NewEncoder(base64.StdEncoding, buf)
 		encoder.Write(certBytes)
 		encoder.Close()
 
-		// 4. Send the result down the pipeline.
 		formatted := FormattedEntry{
 			LogIndex: currentIndex,
 			Buffer:   buf,
