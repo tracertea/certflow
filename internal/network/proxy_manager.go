@@ -82,6 +82,7 @@ func NewProxyManager(logURL string, concurrencyPerProxy int, cfg *config.Config,
 			state:            healthy,
 			concurrencySlots: createSlots(concurrencyPerProxy),
 			client:           &http.Client{Timeout: 45 * time.Second},
+			histogram:        hdrhistogram.New(1_000_000, 60_000_000_000, 3),
 		}
 		mgr.proxies = append(mgr.proxies, proxy)
 		return mgr, nil
